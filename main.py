@@ -15,12 +15,15 @@ ln(earners + 0.5), each slope shrunk toward its tier's pooled slope,
 weighted by earner count and damped with horizon. The two forecasts are
 combined into a rate, blended with a shrunk logit-rate trend and 20%
 persistence toward the last observed rate, with the median move capped.
-When history is flat or stale (no refresh seen yet) a refresh/dilution
-prior applies: the first documented refresh took players 638 -> 3,868
-while non-tutorial earners grew only ~x1.34, so rates fell to ~x0.22;
-medians shade down and the downward spread widens. Quantile spreads are
-asymmetric on the logit scale, combining a sqrt-horizon random walk, a
-per-trophy residual term and dilution terms.
+When history is flat or stale (no refresh seen yet) a generative
+refresh model applies: the first documented refresh took players
+638 -> 3,868 (x6.06) while a typical trophy's earners grew x1.34, so
+a rate moves to r x 1.34 / 6.06 on the refreshed page (the platinum's
+earners stay put); the spread is that refresh's own noise -- cohort
+dispersion, new-earner Poisson noise and jump-size uncertainty.
+Otherwise quantile spreads are asymmetric on the logit scale,
+combining a sqrt-horizon random walk, a per-trophy residual term
+and dilution terms.
 
 Standard library only. Deterministic. No network.
 """
@@ -36,6 +39,12 @@ Z = (-1.6448536269514722, -0.6744897501960817, 0.0,
 EPS = 0.01          # logit clamp for rates in percent
 MAX_RATE = 99.99
 PLATINUM_RATE = 99.99  # a trophy at (essentially) 100% stays there
+# The documented first Exophase refresh (case notes / kit): players
+# 638 -> 3,868 (x6.06) while a typical trophy's earners grew x1.34.
+G_REFRESH = 6.06    # tracked-players jump at one refresh
+G_EARN = 1.34       # typical per-trophy earner growth at one refresh
+SIG_COHORT = 0.38   # logit sd of per-trophy growth around the typical
+SIG_REFRESH = 0.20  # logit sd from the jump sizes themselves
 
 
 def parse_time(s):
@@ -345,12 +354,24 @@ def forecast_case(case):
         last_logit = logit_pct(r_last)
         m_logit = min(max(m_logit, last_logit - 3.0), last_logit + 3.0)
 
-        # Flat / stale branch: shade the median down by the refresh
-        # dilution prior (players jump, earners barely move).
+        # Flat / stale branch: an unseen Exophase refresh is the event
+        # being forecast. Generative model of one refresh, from the one
+        # documented in the case notes (players 638 -> 3,868 while total
+        # earners grew 943 -> 4,276): the tracked-player count jumps by
+        # G_REFRESH, a typical trophy's earners grow by G_EARN, the
+        # everyone-has-it trophy stays ~100% (handled above) and the
+        # platinum's earners stay put (nobody new can hold it yet), so a
+        # rate moves to r * g / G on the refreshed page. The spread is
+        # the refresh's own noise: cohort-preference dispersion, the
+        # Poisson noise of the new earners and uncertainty in the jump
+        # sizes -- calibrated, roughly symmetric on the logit scale,
+        # instead of a wide one-sided dilution band.
         if flat or stale:
             strength = 1.0 if flat else 0.5
-            m_logit = m_logit + math.log(dilution_factor) * strength \
-                if r_last > 0 else m_logit
+            g_i = 1.0 if tier == "platinum" else G_EARN
+            r_med = r_last * g_i / G_REFRESH
+            gen_logit = logit_pct(r_med) if r_med > 0 else last_logit
+            m_logit = strength * gen_logit + (1.0 - strength) * m_logit
             m_logit = min(m_logit, last_logit)  # never shade upward here
 
         median = inv_logit_pct(m_logit)
@@ -359,13 +380,18 @@ def forecast_case(case):
         resid = min(max(residuals[i], 0.05), 1.0)
         rw = 0.5 * sqrt_d
         if flat or stale:
-            # One (or more) unseen refreshes dominate the uncertainty:
-            # the downward side is wide, the upward side stays modest.
-            dil_lo = 1.2 * math.sqrt(max(n_refresh, 1.0))
-            dil_hi = 0.35 * math.sqrt(max(n_refresh, 1.0))
-            sig_lo = math.sqrt(rw * rw + resid * resid + dil_lo * dil_lo)
-            sig_hi = math.sqrt(rw * rw + resid * resid + dil_hi * dil_hi)
-            sig_lo *= 1.45  # widen the downward spread in this branch
+            e_last_i = r_last / 100.0 * max(p_last, 1.0)
+            lam_i = max((G_EARN - 1.0) * e_last_i, 0.0) \
+                if tier != "platinum" else 0.0
+            e_new_i = max(G_EARN * e_last_i, 1.0) \
+                if tier != "platinum" else max(e_last_i, 1.0)
+            sig_gen = math.sqrt(SIG_COHORT * SIG_COHORT
+                                + lam_i / (e_new_i * e_new_i)
+                                + SIG_REFRESH * SIG_REFRESH)
+            if stale and not flat:
+                sig_gen *= 1.3
+            sig_lo = sig_gen
+            sig_hi = sig_gen
         else:
             dil_lo = 0.25 * sqrt_d
             dil_hi = 0.15 * sqrt_d
