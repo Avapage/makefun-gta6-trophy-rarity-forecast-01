@@ -6,10 +6,11 @@ Reads every *.in case in $MAKEFUN_INPUT_DIR (else /input) and writes
 trophy's earn rate at the case target.
 
 Model: decompose each trophy's rate as earners / players and forecast the
-two components separately on log-time, x = ln(1 + hours since release).
-Players by a least-squares fit on ln(players) blending the full-history
-slope with the recent (post-change-point) slope, anchored at the last read
-and with growth clamped. Earners per trophy by least squares on
+two components separately on log-time, x = ln(1 + hours since release),
+fitting over change points: each component's slope blends its
+full-history least-squares slope with the slope of the latest segment
+after a level jump, so the flat launch-night stretch does not attenuate
+the growth seen after the first refresh. Earners per trophy by least squares on
 ln(earners + 0.5), each slope shrunk toward its tier's pooled slope,
 weighted by earner count and damped with horizon. The two forecasts are
 combined into a rate, blended with a shrunk logit-rate trend and 20%
@@ -98,6 +99,38 @@ def change_points(xs_series):
     return pts
 
 
+def segment_start(xs, ys, min_points=3):
+    """Start index of the latest segment after a change point.
+
+    Change points are jumps > 0.35 in the series (log space). If the
+    latest segment has too few points, fall back to the last quarter of
+    the series; if the series is too short, start at 0.
+    """
+    n = len(xs)
+    if n < 2:
+        return 0
+    cps = change_points(ys)
+    if cps and n - cps[-1] >= min_points:
+        return cps[-1]
+    k = max(n // 4, 1)
+    if n - (n - k) >= min_points or n <= min_points:
+        return n - k if n > min_points else 0
+    return 0
+
+
+def blended_slope(xs, ys, start):
+    """Blend of the full-history LSQ slope and the recent-segment slope."""
+    _, slope_full = lsq_slope_intercept(xs, ys)
+    if len(xs) - start >= 3:
+        _, slope_recent = lsq_slope_intercept(xs[start:], ys[start:])
+    elif len(xs) >= 2:
+        k = max(len(xs) // 4, 1)
+        _, slope_recent = lsq_slope_intercept(xs[-k:], ys[-k:])
+    else:
+        slope_recent = slope_full
+    return 0.5 * slope_full + 0.5 * slope_recent
+
+
 def forecast_case(case):
     trophies = sorted(case.get("trophies", []), key=lambda t: t["id"])
     history = case.get("history", []) or []
@@ -147,6 +180,14 @@ def forecast_case(case):
         if all(v is not None for v in last_rates):
             break
     last_rates = [0.0 if v is None else v for v in last_rates]
+    if n_reads == 0:
+        # No history at all: fall back to a tier prior from the observed
+        # launch-night centre of each tier instead of forecasting 0.01%
+        # for every trophy.
+        tier_prior = {"platinum": 0.63, "gold": 0.94,
+                      "silver": 1.10, "bronze": 1.10}
+        last_rates = [tier_prior.get(t.get("tier", "bronze"), 1.10)
+                      for t in trophies]
 
     # ---- Flat / stale detection ------------------------------------------
     flat = False
@@ -189,17 +230,10 @@ def forecast_case(case):
     p_hat = p_last
     if n_reads >= 2 and p_last > 0:
         ln_p = [math.log(max(p, 1.0)) for p in players]
-        _, slope_full = lsq_slope_intercept(xs, ln_p)
-        # Recent slope: after the last change point, if enough reads.
-        cps = change_points(ln_p)
-        recent_start = cps[-1] if cps else 0
-        if n_reads - recent_start >= 3:
-            _, slope_recent = lsq_slope_intercept(
-                xs[recent_start:], ln_p[recent_start:])
-        else:
-            k = max(n_reads // 4, 1)
-            _, slope_recent = lsq_slope_intercept(xs[-k:], ln_p[-k:])
-        slope_p = 0.5 * slope_full + 0.5 * slope_recent
+        # Blend the full-history slope with the recent (post-change-point)
+        # slope so a level jump does not dominate the growth estimate.
+        start = segment_start(xs, ln_p)
+        slope_p = blended_slope(xs, ln_p, start)
         slope_p = min(max(slope_p, -0.5), 3.0)
         dx = max(x_target - xs[-1], 0.0)
         growth = math.exp(slope_p * dx)
@@ -224,12 +258,24 @@ def forecast_case(case):
             pts_e.append(math.log(e + 0.5))
             pts_l.append(logit_pct(r))
         if len(pts_x) >= 2:
-            _, b_e = lsq_slope_intercept(pts_x, pts_e)
+            # Fit over change points: blend the full-history slope with
+            # the recent-segment slope so the flat launch-night stretch
+            # does not attenuate the growth seen after the first refresh.
+            seg = segment_start(pts_x, pts_e)
+            b_e = blended_slope(pts_x, pts_e, seg)
             a_l, b_l = lsq_slope_intercept(pts_x, pts_l)
+            if len(pts_x) - seg >= 3:
+                a_lr, b_lr = lsq_slope_intercept(
+                    pts_x[seg:], pts_l[seg:])
+                b_l = 0.5 * b_l + 0.5 * b_lr
+                a_l = a_lr
+                res = [y - (a_lr + b_lr * x)
+                       for x, y in zip(pts_x[seg:], pts_l[seg:])]
+            else:
+                res = [y - (a_l + b_l * x) for x, y in zip(pts_x, pts_l)]
             earner_slopes[i] = b_e
             logit_slopes[i] = b_l
-            if len(pts_x) >= 3:
-                res = [y - (a_l + b_l * x) for x, y in zip(pts_x, pts_l)]
+            if len(res) >= 3:
                 mean_res = sum(res) / len(res)
                 var = sum((v - mean_res) ** 2 for v in res) / max(len(res) - 2, 1)
                 residuals[i] = math.sqrt(max(var, 0.0))
